@@ -1,0 +1,54 @@
+# Keep this clone's main current with LNPANDY/NX2Apple.
+#
+# This repository is a separate clone, not a GitHub fork, so the merge-upstream
+# API does not apply. The job fetches upstream main and updates this main:
+# fast-forward when every local commit is already in upstream, otherwise a
+# merge. A conflict fails the job and pushes nothing.
+#
+# On LNPANDY/NX2Apple itself the job exits without fetching, so the file is
+# harmless if it is ever merged upstream.
+name: Sync fork
+
+on:
+  schedule:
+    # Every six hours. LNPANDY/main moves several times a day; GitHub may
+    # start the run late.
+    - cron: '20 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-fork
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Fast-forward or merge LNPANDY/main
+        run: |
+          set -euo pipefail
+          origin_url=$(git remote get-url origin)
+          case "$origin_url" in
+            *github.com/LNPANDY/NX2Apple*)
+              echo "This checkout is LNPANDY/NX2Apple; nothing to sync."
+              exit 0
+              ;;
+          esac
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/LNPANDY/NX2Apple.git
+          git fetch --no-tags upstream main
+          if git merge-base --is-ancestor HEAD upstream/main; then
+            git merge --ff-only upstream/main
+          else
+            git merge --no-edit upstream/main
+          fi
+          git push origin HEAD:main
