@@ -22,10 +22,13 @@ sys.path.insert(0, str(ROOT / 'frontend-qt'))
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
 from nspb_qt import build_failure as bf  # noqa: E402
-from nspb_qt.localization import TABLE  # noqa: E402
+from nspb_qt.i18n import Lang  # noqa: E402
+from nspb_qt.l10n import TABLE  # noqa: E402
 
 FIXTURES = json.loads((ROOT / 'frontend/Tests/Fixtures/build_failures.json').read_text(encoding='utf-8'))
-SWIFT = (ROOT / 'frontend/Sources/NSPortBuilder/BuildFailure.swift').read_text(encoding='utf-8')
+# the table is the classifier's (the app target), the kinds and their override flags are NXCore's
+SWIFT = ''.join((ROOT / 'frontend/Sources' / f).read_text(encoding='utf-8')
+                for f in ('NXCore/BuildFailureClassifier.swift', 'NXCore/BuildFailureKind.swift'))
 
 
 def fixture(pattern_id: str) -> dict:
@@ -45,14 +48,19 @@ class Classifier(unittest.TestCase):
     def test_every_kind_is_reachable(self):
         self.assertEqual({k for _, k, _ in bf.TABLE}, set(bf.KINDS))
 
-    def test_the_vendored_scripts_still_say_what_the_patterns_expect(self):
+    def test_the_engines_scripts_still_say_what_the_patterns_expect(self):
         """A sync that rewords a message must fail here, not turn a hint into the raw last line."""
         for f in FIXTURES:
             with self.subTest(pattern=f['id']):
                 if f['source'] == 'errno':   # the system's own text, not the script's
                     self.assertEqual(os.strerror(errno.ENOSPC), f['fragment'])
                     continue
-                there = f['fragment'] in (ROOT / f['source']).read_text(encoding='utf-8')
+                if f['source'] == 'errno45':   # the system's text for ENOTSUP, which renamex_np answers on a volume without RENAME_SWAP
+                    self.assertEqual(os.strerror(errno.ENOTSUP), f['fragment'])
+                    continue
+                if f['source'] == 'codesign':   # Apple's text, from a tool the script runs
+                    continue
+                there = f['fragment'] in (ROOT / 'engine' / f['source']).read_text(encoding='utf-8')
                 if f.get('pending_sync'):
                     self.assertFalse(there, f"{f['id']} is in {f['source']} now: remove pending_sync ({f['pending_sync']}) from the fixture")
                 else:
@@ -95,11 +103,29 @@ class Rows(unittest.TestCase):
             self.assertEqual(bf.classify(fixture(pid)['text']).kind, kind, pid)
         self.assertEqual(bf.classify('copying: no such file: x').kind, bf.UNKNOWN)
 
+    def test_the_older_several_games_message_still_classifies(self):   # the stable and experimental engine channels can still serve the text before the pin of cd859c38
+        log = '[RED] more than one game in the folder, keep one game per folder: 0100000000010000, 01006F8002326000'
+        self.assertEqual(bf.classify(log).kind, bf.SEVERAL_GAMES)
+
     def test_details(self):
         self.assertEqual(bf.classify(fixture('disk.low')['text']).detail, fixture('disk.low')['gb'])
         self.assertIsNone(bf.classify(fixture('disk.full')['text']).detail)
         log = 'skipping an empty file: a.nsp\n' + fixture('games.noTitleID')['text'] + '\n'
         self.assertEqual(bf.classify(log).detail, fixture('games.noTitleID')['folder'])
+
+    def test_offline_pipelines_explain_low_space_and_keep_the_engine_estimate(self):
+        for pid, gb in (('pso.low', '3'), ('pso.merge', '2.5'), ('pso.failed', None)):
+            with self.subTest(pattern=pid):
+                failure = bf.classify(fixture(pid)['text'])
+                self.assertEqual(failure.kind, 'psoDiskFull')
+                self.assertEqual(failure.detail, gb)
+                self.assertIsNone(failure.flag)
+        for code in ('en', 'zh', 'sv', 'de', 'fr', 'it'):
+            for suffix in ('what', 'whatNeeds', 'next'):
+                self.assertTrue(TABLE[f'fail.psoDiskFull.{suffix}'][code], code)
+            self.assertIn('%@', TABLE['fail.psoDiskFull.whatNeeds'][code])
+        self.assertEqual(bf.classify('[RED] pso_offline: metal-tt failed for applegpu_g18p (exit 1): compiler error').kind, bf.UNKNOWN)
+        self.assertEqual(bf.classify('pso_offline: applegpu_g18p: batch 1/2: ready (compiled)').kind, bf.UNKNOWN)
 
     def test_a_keys_file_that_cannot_be_read_is_known_from_the_file(self):
         log = '[RED] nx_extract exit code 1 (full output: /w/extract.log)'
@@ -112,18 +138,34 @@ class Rows(unittest.TestCase):
                  bf.NO_TITLE_ID: ['Rename the file', '0100XXXXXXXXXXXX', 'exact package', 'iCloud', 'Show folder'],
                  bf.DISK_FULL: ['Free up space', '_build']}
         for kind, ws in words.items():
-            en = TABLE[f'fail.{kind}.next'][1]
+            en = TABLE[f'fail.{kind}.next']['en']
             for w in ws:
                 self.assertIn(w, en, kind)
         for key in ('fail.showFolder', 'fail.keys.button', 'fail.diskFull.whatNeeds'):
             self.assertIn(key, TABLE)
-            self.assertTrue(TABLE[key][2] and TABLE[key][2] != TABLE[key][1], key)   # Swedish present
+            self.assertTrue(TABLE[key]['sv'] and TABLE[key]['sv'] != TABLE[key]['en'], key)   # Swedish present
+            self.assertTrue(TABLE[key]['de'] and TABLE[key]['de'] != TABLE[key]['en'], key)   # German present
+
+    def test_a_missing_zbic_package_is_its_own_row(self):
+        log = '[3/9] extract\n' + fixture('zbic.missing')['text'] + '\n'
+        self.assertEqual(bf.classify(log).kind, bf.ZBIC)
+        self.assertEqual(bf.classify('[RED] the zbic package decoded it').kind, bf.UNKNOWN)
+        self.assertIn('pip install zbic', TABLE['fail.zbic.next']['en'])
+        self.assertIn('zbic', TABLE['fail.zbic.button']['en'])
+
+    def test_the_python_probe_and_the_venv_install_name_zbic(self):
+        pkg = ROOT / 'frontend-qt/nspb_qt'
+        self.assertIn('import lz4, capstone, fontTools, zbic', (pkg / 'platform_util.py').read_text(encoding='utf-8'))
+        model = (pkg / 'model.py').read_text(encoding='utf-8')
+        self.assertIn("pkgs = ['lz4', 'capstone', 'fonttools', 'zbic', 'nsz']", model)
+        self.assertIn("'zbic', 'backports.zstd', 'nsz'", model)
 
     @unittest.skipIf(importlib.util.find_spec('PySide6') is None, 'PySide6 is not installed')
     def test_show_folder_opens_the_game_folder_and_for_a_full_disk_the_build_folder(self):
         import tempfile
         from nspb_qt.model import Model
         m = Model()
+        m.lang = Lang('en')   # these assertions read English whatever the device language is
         with tempfile.TemporaryDirectory() as d:
             m.base_path = str(Path(d, 'game.nsp'))
             self.assertEqual(m.failure_folder(bf.Failure(bf.NO_TITLE_ID, detail='/x')), d)
@@ -176,7 +218,8 @@ class Strings(unittest.TestCase):
         keys = ['fail.section', 'fail.buildAnyway', 'fail.confirm.title', 'fail.confirm.go', 'fail.confirm.cancel',
                 'fail.override.note', 'fail.a32Program.whatNamed', 'fail.translator.button', 'fail.iosSDK.button',
                 'fail.cltSelected.button', 'dep.metal.other', 'dep.fix.metalPin']
-        for kind in bf.KINDS:
+        keys += ['fail.retry', 'engine.syncing']
+        for kind in bf.KINDS + ['engineOffline', 'engineSync']:   # the last two are the engine sync's rows (engine.py's failure_kind)
             keys += [f'fail.{kind}.what', f'fail.{kind}.next']
             if kind in bf.OVERRIDE_FLAGS:
                 keys.append(f'fail.{kind}.risk')
@@ -184,7 +227,7 @@ class Strings(unittest.TestCase):
             with self.subTest(key=key):
                 self.assertIn(key, TABLE)
                 row = TABLE[key]
-                zh, en = row[0], row[1]   # the table may carry a third (Swedish) element
+                zh, en = row['zh'], row['en']   # the table carries more columns (Swedish, German)
                 self.assertTrue(zh and en)
                 for text in (zh, en):
                     self.assertNotIn(';', text)
@@ -193,13 +236,13 @@ class Strings(unittest.TestCase):
 
     def test_the_risk_text_states_the_risk_and_that_it_is_one_build(self):
         for kind in bf.OVERRIDE_FLAGS:
-            en = TABLE[f'fail.{kind}.risk'][1]
+            en = TABLE[f'fail.{kind}.risk']['en']
             self.assertIn('untested', en)
             self.assertIn('one build', en)
 
     def test_the_hints_say_what_the_task_asks(self):
-        self.assertIn('Xcode 27.1 (macOS 26.6 or later)', TABLE['fail.otherMetal.next'][1])
-        self.assertIn("32-bit and can't run on Apple silicon", TABLE['fail.a32Program.what'][1])
+        self.assertIn('Xcode 27.2 (macOS 26.6 or later)', TABLE['fail.otherMetal.next']['en'])
+        self.assertIn("32-bit and can't run on Apple silicon", TABLE['fail.a32Program.what']['en'])
 
 
 try:
@@ -219,6 +262,7 @@ class Window(unittest.TestCase):
         from nspb_qt.model import Model
         from nspb_qt.ui import MainWindow
         m = Model()
+        m.lang = Lang('en')   # these assertions read English whatever the device language is
         w = MainWindow(m)
         # A window left alive is destroyed by PySide after the QApplication at interpreter exit,
         # which segfaults. Delete it (and the model) while the app is still there.

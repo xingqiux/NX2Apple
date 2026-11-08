@@ -1,6 +1,6 @@
 # First-run UI preview
 
-With a recognized `NSPB_ONBOARDING_DEMO` value the app shows a scripted preview of the guided setup. The preview never instantiates `BuildModel`, detects tools, reads selected files, installs anything or opens the App Store. Its exit screen stands in for opening the library. Without it, `RootView` (`OnboardingRoot.swift`) runs the real flow described under "The real driver" below, or opens the launcher.
+With a recognized `NSPB_ONBOARDING_DEMO` value the app shows a scripted preview of the guided setup. The preview never instantiates `LauncherStores`, detects tools, reads selected files, installs anything or opens the App Store. Its exit screen stands in for opening the library. Without it, `RootView` (`OnboardingRoot.swift`) runs the real flow described under "The real driver" below, or opens the launcher.
 
 From the repository root, enter `frontend`, then run one scenario:
 
@@ -14,7 +14,7 @@ NSPB_ONBOARDING_DEMO=noGames swift run
 NSPB_ONBOARDING_DEMO=oldMac swift run
 ```
 
-- `fresh`: Start, select a platform, Continue, Get Xcode, wait, Finish setup, confirm the found keys, review the games, Continue, Open library.
+- `fresh`: Start, select a platform, Continue, Get Xcode, wait, Finish setup, confirm the found keys or continue without keys for decrypted games, review the games, Continue, Open library.
 - `xcodeReady`: the same path, with Xcode already present, and its checks tick through automatically.
 - `keysInvalid`: confirming the found file fails validation. Choose or drop another file to exercise recovery. The mock does not read it.
 - `xcodeFailed`: setup fails with a plain explanation and expandable diagnostics. Retry, then Finish setup to recover.
@@ -37,6 +37,7 @@ finishXcodeSetup()
 retry(_ step: OnboardingStep)
 chooseKeys(_ url: URL)
 confirmKeys()
+skipKeys()
 chooseGames(_ url: URL)
 back()
 next()
@@ -46,7 +47,7 @@ openLibrary()
 
 The driver owns detection, installation, privileges, security-scoped access to selected URLs, validation, decoded cover images, persistence, and navigation. The view owns only presentation, the system chooser, drop URL decoding, disclosure expansion and input handling. No key file contents belong in `OnboardingState`, failure text or diagnostics. Failure messages must already be localized, and `details` is diagnostic text supplied by the driver.
 
-Use `OnboardingState.next()` and `.back()` for gated navigation. `canAdvance` requires disk space on Welcome, a platform selection, Xcode plus all background tasks, valid keys, or a nonempty games list respectively. `primary` distinguishes a step action (Get Xcode, Finish setup, confirm keys, Retry) from advancing. `primaryEnabled` also gates completion and dismissed flows. `setupTasks` derives the iOS row from the selected platform.
+Use `OnboardingState.next()` and `.back()` for gated navigation. `canAdvance` requires disk space on Welcome, a platform selection, Xcode plus all background tasks, validated keys or an explicit skip on the keys step, and at least one game on the games step. After skipping keys, at least one game must be a decrypted Switch 2 folder or a NUP. `primary` distinguishes a step action (Get Xcode, Finish setup, confirm keys, Retry) from advancing. `primaryEnabled` also gates completion and dismissed flows. `setupTasks` derives the iOS row from the selected platform.
 
 Automatic advancement belongs in the driver. The mock gives completed Xcode and keys a brief checkmark hold, then advances. Returning to an already completed step stays there so Back remains useful. Games wait for explicit Continue so the player can review what was found. On a return visit, selecting iPhone after completed Mac setup adds the iOS preparation step.
 
@@ -54,16 +55,16 @@ Persist the current step and selections before handling `skipForLater`, then inj
 
 ## The real driver
 
-`LiveOnboardingDriver` (`LiveOnboardingDriver.swift`) implements the contract over the launcher's own `BuildModel` and `GameLibrary`, which `RootView` shares with `ContentView`. Everything it does to the machine goes through `OnboardingEnvironment`, so the tests use fakes.
+`LiveOnboardingDriver` (`LiveOnboardingDriver.swift`) implements the contract over the launcher's own `LauncherStores` (its `BuildStore` and `DependencyStore`) and `GameLibrary`, which `RootView` shares with `LauncherView`. Everything it does to the machine goes through `OnboardingEnvironment`, so the tests use fakes.
 
-- When it shows: on launch, unless `onboarding.completed` is set or setup is already complete (all tools present, a keys file known, a games folder set, and a complete one is marked done without being shown). Settings has "Run setup again". Set up later stores the step, platform and an in-progress flag in `UserDefaults`, and the next launch resumes there and revalidates (a stored step past Xcode returns to Xcode when Xcode no longer holds).
-- Detection and installs are `BuildModel.checkDeps` / `deps` / `installDep`, one install at a time (Python, .NET, then Homebrew and the formulas). Homebrew waits for Xcode to be ready. The xcode row asks for the iOS SDK only when the stored platform is not Mac-only or builds target an iPhone (`BuildModel.needsIOSPlatform`).
+- When it shows: a completed setup opens the launcher. An unfinished setup with an explicit keys skip and an empty keys slot resumes before checking for discovered files. Keys selected later in the main window supersede that skip. Otherwise, all tools present, a known keys file and a games folder mark setup complete. Settings has "Run setup again". Set up later stores the step, platform, whether the keys step was skipped, and an in-progress flag in `UserDefaults`, and the next launch resumes there and revalidates (a stored step past Xcode returns to Xcode when Xcode no longer holds).
+- Detection and installs are `DependencyStore.check` / `deps` / `install`, one install at a time (Python, .NET, then Homebrew and the formulas). Homebrew waits for Xcode to be ready. The xcode row asks for the iOS SDK only when the stored platform is not Mac-only or builds target an iPhone (`LauncherStores.needsIOSPlatform`).
 - Xcode: missing opens the App Store and polls /Applications for it, and setup is one administrator prompt (`OnboardingAdmin.source`: `xcode-select -s`, `xcodebuild -license accept`, `-runFirstLaunch`), then the Metal Toolchain and, for iPhone or both, the iOS platform without it. A cancelled prompt returns to `needsSetup`.
-- Keys are found in `~/.switch`, `~/Downloads` and the games folder, checked by `KeyCheck`, and only the path goes into the keys slot. Games use `GameLibrary.sourceGames`, `BuildModel.scan` and `GameLibrary.setFolder`.
+- Keys are found in `~/.switch`, `~/Downloads` and the games folder, checked by `KeyCheck`, and only the path goes into the keys slot. **Continue without keys** clears the build’s keys selection and leaves the file on disk. Back preserves the skip until another file is chosen. Returning to a saved step that required keys asks for them again if the slot is empty or its file disappeared. The final summary shows skipped keys separately from verified ones. Games use `GameLibrary.sourceGames`, `BuildStore.scan` and `GameLibrary.setFolder`.
 
 ## NVN hints
 
-NVN games' shaders need the Metal compiler of Xcode 27.1, which needs macOS 26.6. `OnboardingState.osTooOldForNVN` (macOS below 26.6, from `OnboardingEnvironment.osVersion`) adds a calm note to Welcome, and `xcodeTooOldForNVN` (the probe's `xcodebuild -version` below 27.1, where an unreadable version never counts) adds a secondary line in the Xcode card. Neither gates anything: other games build with an older Xcode.
+NVN games' shaders need the Metal compiler of Xcode 27.2, which needs macOS 26.6. `OnboardingState.osTooOldForNVN` (macOS below 26.6, from `OnboardingEnvironment.osVersion`) adds a calm note to Welcome, and `xcodeTooOldForNVN` (the probe's `xcodebuild -version` below 27.2, where an unreadable version never counts) adds a secondary line in the Xcode card. Neither gates anything: other games build with an older Xcode.
 
 ## Presentation choices
 
@@ -81,4 +82,4 @@ NX_ONBOARDING_CAPTURE_DIR="$PWD/.build/onboarding-captures" swift test --filter 
 
 The last command optionally captures all six screens at minimum window size in English and Simplified Chinese. It only hosts mock SwiftUI views. The normal suite skips that capture unless requested.
 
-Files added: `OnboardingState.swift`, `MockOnboardingDriver.swift`, `OnboardingView.swift`, `OnboardingTests.swift`, and this note. Files changed: `NSPortBuilderApp.swift` (demo branch) and `Localization.swift` (both languages).
+Files added: `OnboardingState.swift`, `MockOnboardingDriver.swift`, `OnboardingView.swift`, `OnboardingTests.swift`, and this note. Files changed: `NX2AppleApp.swift` (demo branch) and `Localization.swift` (both languages).

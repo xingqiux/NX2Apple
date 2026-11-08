@@ -110,6 +110,11 @@ def python_candidates(extra_candidates: list[str] | None = None) -> list[str]:
     """
     cands: list[str] = [venv_python()] + [c for c in (extra_candidates or []) if c]
     if IS_WIN:
+        local_app = Path(os.environ.get('LOCALAPPDATA', str(Path.home() / 'AppData' / 'Local')))
+        tools_root = local_app / 'NS Port Builder' / 'tools'
+        if tools_root.is_dir():
+            for d in sorted(tools_root.glob('python-*'), reverse=True):
+                cands.append(str(d / 'python.exe'))
         cands += [
             os.path.expandvars(r'%LOCALAPPDATA%\Programs\Python\Python312\python.exe'),
             os.path.expandvars(r'%LOCALAPPDATA%\Programs\Python\Python311\python.exe'),
@@ -131,12 +136,12 @@ def python_candidates(extra_candidates: list[str] | None = None) -> list[str]:
 def find_python(extra_candidates: list[str] | None = None) -> tuple[str, bool, str]:
     """The interpreter to build with: (path, has_packages, version_or_empty).
 
-    The build scripts need lz4, capstone, fontTools, zstd and (for compressed dumps) nsz. A
+    The build scripts need lz4, capstone, fontTools, zbic, zstd and (for compressed dumps) nsz. A
     system interpreter rarely has them, so the venv the app manages is checked first, then
     every python on the machine (see python_candidates for the order).
     """
     probe = (
-        "import lz4, capstone, fontTools\n"
+        "import lz4, capstone, fontTools, zbic\n"
         "try:\n"
         "    from compression import zstd\n"
         "except ImportError:\n"
@@ -157,9 +162,9 @@ def find_python(extra_candidates: list[str] | None = None) -> tuple[str, bool, s
         if not ver or _ver_tuple(ver) < MIN_PYTHON:
             continue
         if _runs(c, ['-c', probe]):
-            if ready is None or _ver_tuple(ver) > _ver_tuple(ready[1]):
+            if ready is None or _win_ver_rank(ver) > _win_ver_rank(ready[1]):
                 ready = (c, ver)
-        elif fallback is None or _ver_tuple(ver) > _ver_tuple(fallback[1]):
+        elif fallback is None or _win_ver_rank(ver) > _win_ver_rank(fallback[1]):
             fallback = (c, ver)
     if ready:
         return (ready[0], True, ready[1])
@@ -178,7 +183,13 @@ def venv_base(preferred: str) -> str | None:
     `-m venv`, and the Python row never recovered from it. So a base that does not run at the
     required version falls back to the newest candidate that does.
     """
-    if Path(preferred).is_file() and os.access(preferred, os.X_OK):
+    p = Path(preferred) if preferred else Path()
+    if preferred and p.is_dir():
+        sub = p / ('python.exe' if IS_WIN else 'bin/python3')
+        if sub.is_file():
+            p = sub
+            preferred = str(sub)
+    if preferred and p.is_file() and os.access(preferred, os.X_OK):
         v = _python_version(preferred)
         if v and _ver_tuple(v) >= MIN_PYTHON:
             return preferred
@@ -189,7 +200,7 @@ def venv_base(preferred: str) -> str | None:
         v = _python_version(c)
         if not v or _ver_tuple(v) < MIN_PYTHON:
             continue
-        if best is None or _ver_tuple(v) > _ver_tuple(best[1]):
+        if best is None or _win_ver_rank(v) > _win_ver_rank(best[1]):
             best = (c, v)
     return best[0] if best else None
 
@@ -197,7 +208,7 @@ def venv_base(preferred: str) -> str | None:
 def _python_version(py: str) -> str:
     try:
         r = subprocess.run([py, '-c', 'import sys;print("%d.%d"%sys.version_info[:2])'],
-                           capture_output=True, text=True, timeout=20)
+                           capture_output=True, text=True, timeout=20, env=child_env())
         return r.stdout.strip() if r.returncode == 0 else ''
     except Exception:
         return ''
@@ -211,9 +222,16 @@ def _ver_tuple(v: str) -> tuple[int, int]:
         return (0, 0)
 
 
+def _win_ver_rank(v: str) -> tuple[int, int, int]:
+    vt = _ver_tuple(v)
+    # On Windows the bundled offline wheels target Python 3.12 (cp312); prefer 3.12 over
+    # pre-release/newer system Pythons (e.g. 3.15) when both are present on the machine.
+    return (1 if (IS_WIN and vt == (3, 12)) else 0, vt[0], vt[1])
+
+
 def _runs(exe: str, args: list[str]) -> bool:
     try:
-        return subprocess.run([exe] + args, capture_output=True, timeout=120).returncode == 0
+        return subprocess.run([exe] + args, capture_output=True, timeout=120, env=child_env()).returncode == 0
     except Exception:
         return False
 
@@ -340,13 +358,31 @@ def child_env(extra: dict[str, str] | None = None) -> dict[str, str]:
     HOME/USER present (a GUI launch can strip them), and DOTNET_CLI_HOME so .NET's first-run
     state has somewhere to go."""
     env = dict(os.environ)
-    dirs = [env.get('PATH', '')]
+    meipass = getattr(sys, '_MEIPASS', None) or env.get('_MEIPASS') or env.get('_MEIPASS2')
+    is_frozen = bool(getattr(sys, 'frozen', False) or meipass)
+    env.pop('_MEIPASS', None)
+    env.pop('_MEIPASS2', None)
+    if is_frozen:
+        for k in ('PYTHONHOME', 'QT_PLUGIN_PATH', 'QML2_IMPORT_PATH'):
+            env.pop(k, None)
+    meipass_norm = os.path.normcase(os.path.normpath(meipass)) if meipass else None
+    sep = ';' if IS_WIN else ':'
+    if meipass_norm and 'PYTHONPATH' in env:
+        clean_pypath = [
+            d for d in env['PYTHONPATH'].split(sep)
+            if d and os.path.normcase(os.path.normpath(d)) != meipass_norm
+        ]
+        if clean_pypath:
+            env['PYTHONPATH'] = sep.join(clean_pypath)
+        else:
+            env.pop('PYTHONPATH', None)
+    raw_dirs = [d for d in env.get('PATH', '').split(sep)
+                if d and (not meipass_norm or os.path.normcase(os.path.normpath(d)) != meipass_norm)]
+    dirs = [sep.join(raw_dirs)]
     if IS_WIN:
         dirs += [r'C:\Program Files\dotnet', os.path.expandvars(r'%LOCALAPPDATA%\Microsoft\dotnet')]
-        sep = ';'
     else:
         dirs += ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin']
-        sep = ':'
     env['PATH'] = sep.join(d for d in dirs if d)
     if not env.get('HOME') or not Path(env['HOME']).is_dir():
         env['HOME'] = str(Path.home())
@@ -357,6 +393,8 @@ def child_env(extra: dict[str, str] | None = None) -> dict[str, str]:
     # telemetry call can hang the very first run on a network that cannot reach Microsoft.
     env.setdefault('DOTNET_CLI_TELEMETRY_OPTOUT', '1')
     env.setdefault('DOTNET_NOLOGO', '1')
+    env.setdefault('PYTHONUTF8', '1')
+    env.setdefault('PYTHONIOENCODING', 'utf-8')
     if extra:
         env.update(extra)
     return env
@@ -373,6 +411,85 @@ def no_window_kwargs() -> dict:
     if IS_WIN:
         return {'creationflags': subprocess.CREATE_NO_WINDOW}
     return {}
+
+
+_ORIG_POPEN_INIT = subprocess.Popen.__init__
+
+
+def reveal(path: str | Path | None) -> bool:
+    """Show `path` in the system file manager (Explorer on Windows, Finder on macOS).
+
+    If `path` is a file (such as an `.ipa` or `romfs.img`), opens its parent folder with the
+    file selected; if `path` is a folder that contains `romfs.img`, opens that folder with
+    `romfs.img` selected; otherwise opens the folder itself.
+    """
+    if not path:
+        return False
+    p = Path(str(path)).expanduser()
+    if not p.exists():
+        if p.parent.is_dir():
+            p = p.parent
+        else:
+            return False
+    if p.is_dir() and (p / 'romfs.img').is_file():
+        target = (p / 'romfs.img').resolve()
+        is_file = True
+    else:
+        target = p.resolve()
+        is_file = target.is_file()
+
+    if IS_WIN:
+        norm = os.path.normpath(str(target))
+        if is_file:
+            try:
+                import ctypes
+                shell32 = ctypes.windll.shell32
+                shell32.ILCreateFromPathW.argtypes = [ctypes.c_wchar_p]
+                shell32.ILCreateFromPathW.restype = ctypes.c_void_p
+                shell32.SHOpenFolderAndSelectItems.argtypes = [
+                    ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_ulong
+                ]
+                shell32.SHOpenFolderAndSelectItems.restype = ctypes.c_long
+                shell32.ILFree.argtypes = [ctypes.c_void_p]
+                shell32.ILFree.restype = None
+                ctypes.windll.ole32.CoInitialize(None)
+                pidl = shell32.ILCreateFromPathW(norm)
+                if pidl:
+                    try:
+                        hr = shell32.SHOpenFolderAndSelectItems(pidl, 0, None, 0)
+                        if hr == 0:
+                            return True
+                    finally:
+                        shell32.ILFree(pidl)
+            except Exception:
+                pass
+            try:
+                subprocess.Popen(['explorer.exe', f'/select,{norm}'])
+                return True
+            except OSError:
+                pass
+        folder_norm = os.path.normpath(str(target.parent if is_file else target))
+        if hasattr(os, 'startfile'):
+            try:
+                os.startfile(folder_norm)  # type: ignore[attr-defined]
+                return True
+            except OSError:
+                pass
+    elif IS_MAC:
+        try:
+            cmd = ['/usr/bin/open', '-R', str(target)] if is_file else ['/usr/bin/open', str(target)]
+            subprocess.Popen(cmd)
+            return True
+        except OSError:
+            pass
+
+    try:
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+        open_dir = target.parent if is_file else target
+        return bool(QDesktopServices.openUrl(QUrl.fromLocalFile(str(open_dir))))
+    except Exception:
+        return False
 
 
 def hide_console_for_children() -> None:
@@ -397,7 +514,12 @@ def hide_console_for_children() -> None:
     original = subprocess.Popen.__init__
 
     def patched(self, args, *a, **k):        # noqa: ANN001 - mirrors Popen.__init__
-        if not k.get('creationflags') and not k.get('startupinfo'):
+        first = ''
+        if isinstance(args, (list, tuple)) and args:
+            first = os.path.basename(str(args[0])).lower()
+        elif isinstance(args, str):
+            first = os.path.basename(args.split()[0] if args.split() else '').lower()
+        if first not in ('explorer', 'explorer.exe') and not k.get('creationflags') and not k.get('startupinfo'):
             k['creationflags'] = subprocess.CREATE_NO_WINDOW
         original(self, args, *a, **k)
 

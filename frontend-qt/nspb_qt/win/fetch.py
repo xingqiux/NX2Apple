@@ -384,7 +384,7 @@ def install_python(dest: Path | None = None,
     survives app updates like every other tool the app fetches.
 
     `Include_pip=1` matters: the interpreter alone is not enough, the build needs lz4, capstone,
-    fonttools and nsz, and the front end installs those into a venv made from this interpreter.
+    fonttools, zbic and nsz, and the front end installs those into a venv made from this interpreter.
     The bootstrapper blocks until the install finishes, so the caller can probe the result.
     """
     log = log or (lambda s: None)
@@ -442,13 +442,17 @@ def install_zstd(dest: Path | None = None,
     staging.mkdir(parents=True)
     try:
         with zipfile.ZipFile(zpath) as z:
-            for info in z.infolist():
-                if info.is_dir():
-                    continue
+            members = [m for m in z.infolist() if not m.is_dir()]
+            grand = sum(m.file_size for m in members) or 1
+            done = 0
+            for info in members:
                 out = staging / _strip_root(info.filename)
                 out.parent.mkdir(parents=True, exist_ok=True)
                 with z.open(info) as src, open(out, 'wb') as dst:
                     shutil.copyfileobj(src, dst, 1 << 20)
+                done += info.file_size
+                if unpack_progress:
+                    unpack_progress(done, grand)
     except zipfile.BadZipFile as e:
         shutil.rmtree(staging, ignore_errors=True)
         raise DownloadError(f'{zpath.name} is not a valid zip: {e}') from e
@@ -496,8 +500,7 @@ def install_git(arch: str | None = None, dest: Path | None = None,
     if exe.is_file():
         log(f'git is already installed: {exe}')
         return exe
-    base = Path(__file__).resolve().parents[2]
-    cache = base / '.tools' / 'downloads'
+    cache = tc.tools_dir() / 'downloads'
     cache.mkdir(parents=True, exist_ok=True)
     url = f'{tc.GIT_RELEASE_URL}/{asset["name"]}'
     log(f'downloading {asset["name"]} ({asset["size"] // 1048576 if asset["size"] else "~57"} MB)')
@@ -558,3 +561,47 @@ def _download_unverified(url: str, dest: Path, log: Callable[[str], None],
     except (urllib.error.URLError, OSError) as e:
         tmp.unlink(missing_ok=True)
         raise DownloadError(f'download failed: {url}: {e}') from e
+
+
+def install_metal_from_zip(zip_path: Path, dest: Path | None = None,
+                           log: Callable[[str], None] | None = None) -> Path:
+    """Unpack a "Metal Developer Tools for Windows" zip the user downloaded from Apple, and
+    return the folder to write into `toolchain.json` as `metal_dir`.
+
+    Apple's tools are Apple-ID-gated and cannot be downloaded by the app; the browser download
+    is the licensed path, and this is the app doing the unpack the user would otherwise do by
+    hand — into `tools_dir()`, the same place the other toolchains live, surviving app updates.
+    The zip is validated before anything is remembered: it must contain `metal.exe` (5.x/6.x in
+    `bin/`, 4.x in `ios/bin/`), matching `toolchain.metal_dir()`'s two accepted layouts.
+    """
+    import zipfile as _zf
+    src = Path(zip_path)
+    if not src.is_file():
+        raise DownloadError(f'{src} does not exist')
+    if log:
+        log(f'unpacking {src.name} …')
+    dest = Path(dest) if dest else tc.tools_dir() / 'metal-developer-tools'
+    staging = dest.parent / (dest.name + '-staging')
+    shutil.rmtree(staging, ignore_errors=True)
+    staging.mkdir(parents=True)
+    try:
+        with _zf.ZipFile(src) as z:
+            bad = [i.filename for i in z.infolist() if i.filename.startswith('/') or '..' in Path(i.filename).parts]
+            if bad:
+                raise DownloadError(f'unsafe paths inside {src.name}: {bad[:3]}')
+            z.extractall(staging)
+    except _zf.BadZipFile as e:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise DownloadError(f'{src.name} is not a zip file ({e})') from e
+
+    hit = tc.resolve_metal_dir(staging)
+    if hit is None:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise DownloadError(f'{src.name} does not look like Metal Developer Tools '
+                            '(no metal.exe in bin/ or ios/bin/)')
+    shutil.rmtree(dest, ignore_errors=True)
+    hit.rename(dest)
+    shutil.rmtree(staging, ignore_errors=True)
+    if log:
+        log(f'Metal Developer Tools unpacked to {dest}')
+    return dest

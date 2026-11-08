@@ -122,15 +122,28 @@ def git_exe() -> Path | None:
     return Path(found) if found else None
 
 #: The iPhoneOS SDK we pin. `xybp888/iOS-SDKs` is a plain git repository of SDK trees, so a
-#: shallow clone is enough and the commit SHA pins the content. 26.0 is what `dm/ios/project.yml`
-#: targets; 26.5 is accepted too, since a newer SDK still compiles against 26.0.
+#: shallow clone is enough and the commit SHA pins the content. 27.2 matches the upstream
+#: Xcode 27.2 engine headers while targeting the 26.0 deployment floor; 26.x SDKs remain
+#: accepted with the `win/ios/sdk_compat` fallback headers.
 SDK_REPO = 'https://github.com/xybp888/iOS-SDKs'
-SDK_PINNED = 'iPhoneOS26.0.sdk'
-SDK_ACCEPTED = ('iPhoneOS26.0.sdk', 'iPhoneOS26.1.sdk', 'iPhoneOS26.2.sdk', 'iPhoneOS26.3.sdk',
-                'iPhoneOS26.4.sdk', 'iPhoneOS26.4.1.sdk', 'iPhoneOS26.5.sdk')
+SDK_PINNED = 'iPhoneOS27.2.sdk'
+SDK_ACCEPTED = ('iPhoneOS27.2.sdk', 'iPhoneOS27.1.sdk', 'iPhoneOS27.0.sdk',
+                'iPhoneOS26.5.sdk', 'iPhoneOS26.4.1.sdk', 'iPhoneOS26.4.sdk',
+                'iPhoneOS26.3.sdk', 'iPhoneOS26.2.sdk', 'iPhoneOS26.1.sdk',
+                'iPhoneOS26.0.sdk')
 #: Commit of `xybp888/iOS-SDKs` the pinned SDK was read from. Informational: the SDK tree is
 #: verified by its own layout and a caller-supplied hash, not by trusting this number.
-SDK_PINNED_COMMIT = '17eb9152ba9779b27427016472758824a8fcd6a7'
+SDK_PINNED_COMMIT = '4a48e5409f8ea6ac422c44d91b86fa0f8ae010ff'
+#: Single-file release archive from `xybp888/iOS-SDKs/releases`, used before the git route so
+#: mainland networks can fetch the SDK through `GITHUB_MIRRORS` + `rank_by_speed` without
+#: needing PortableGit or a multi-step `git sparse-checkout` over 67k objects.
+SDK_RELEASE_TAG = 'iOS27.2-SDKs'
+SDK_ASSET = {
+    'name': f'{SDK_PINNED}.zip',
+    'url': f'{SDK_REPO}/releases/download/{SDK_RELEASE_TAG}/{SDK_PINNED}.zip',
+    'sha256': '5423a4ea3bf33a215380cd9bab1819df2ddd6a0c522b3afeb0b86647934f4349',
+    'size': 55417972,
+}
 
 #: .NET SDK. `dm/tools/nx_extract` targets net10.0 and the shader translator's runtimeconfig is
 #: net10.0, so 10 is the floor; a newer major (11) can still build a net10.0 project as long as
@@ -200,6 +213,7 @@ ENV_SDK_SHA = 'NSPB_IOS_SDK_SHA256'
 
 MACHO_MAGIC_64 = 0xFEEDFACF
 MH_EXECUTE = 2
+MH_DYLIB = 6
 CPU_TYPE_ARM64 = 0x0100000C
 PLATFORM_IOS = 2
 
@@ -246,7 +260,7 @@ def no_window() -> dict:
 
 def config_path() -> Path:
     """`toolchain.json` in the app's data folder (shared with the venv location)."""
-    base = Path(os.environ.get('LOCALAPPDATA', Path.home() / 'AppData' / 'Local'))
+    base = Path(os.environ.get('LOCALAPPDATA') or (Path.home() / 'AppData' / 'Local'))
     return base / 'NS Port Builder' / 'toolchain.json'
 
 
@@ -610,14 +624,137 @@ def sdk_cache_dir() -> Path:
     return base / 'NS Port Builder' / 'sdks'
 
 
+def _is_symlink_stub_bytes(raw: bytes) -> str | None:
+    """Return the relative target string if `raw` looks like a git symlink stub, else None."""
+    if not (1 <= len(raw) <= 256) or raw.startswith(b'--- !tapi-tbd'):
+        return None
+    if any(b in raw for b in (b'\n', b'\r', b'\x00', b' ', b'\t', b';', b'{', b'}', b'#', b':')):
+        return None
+    try:
+        target = raw.decode('utf-8')
+    except UnicodeDecodeError:
+        return None
+    if not target or ':' in target or target in ('.', '..') or target.startswith(('/', '\\')):
+        return None
+    return target
+
+
+def repair_tbd_stubs(
+    sdk: Path | str,
+    log=None,
+    *,
+    max_bytes: int | None = None,
+    bytes_used: int = 0,
+    max_entries: int | None = None,
+    entries_used: int = 0,
+    error_cls: type[Exception] | None = None,
+) -> int:
+    """Fix git symlink text stubs (`.tbd`, `.h`, framework dirs) in a Windows SDK checkout.
+
+    An SDK checked out on Windows without `core.symlinks=true` (or before `materialize_symlinks`
+    used `toolchain.git_exe()`) leaves every symlink as a small one-line text file naming its
+    relative target (`libSystem.tbd` → `libSystem.B.tbd`, `usr/include/pthread.h` →
+    `pthread/pthread.h`, `IOKit.framework/Versions/Current` → `A`). Running up to 4 passes
+    resolves chained symlinks (`libm.tbd` → `libSystem.tbd` → `libSystem.B.tbd` and
+    `Headers` → `Versions/Current/Headers`) without needing git or `.git`.
+    """
+    sdk_abs = Path(os.path.abspath(os.fspath(sdk)))
+    sdk_root = sdk_abs.resolve()
+    exc_type = error_cls or ValueError
+
+    def _charge(added_entries: int, added_bytes: int) -> None:
+        nonlocal entries_used, bytes_used
+        entries_used += added_entries
+        bytes_used += added_bytes
+        if max_entries is not None and entries_used > max_entries:
+            raise exc_type(
+                f'text-stub materialization exceeds entry limit ({entries_used} > {max_entries})'
+            )
+        if max_bytes is not None and bytes_used > max_bytes:
+            raise exc_type(
+                f'text-stub materialization exceeds unpacked size limit ({bytes_used} > {max_bytes} bytes)'
+            )
+
+    fixed = 0
+    for _pass in range(4):
+        round_fixed = 0
+        for p in sorted(sdk_root.rglob('*')):
+            try:
+                if p.is_symlink() or not p.is_file():
+                    continue
+                st = p.stat()
+                if not (1 <= st.st_size <= 256):
+                    continue
+                target = _is_symlink_stub_bytes(p.read_bytes())
+                if not target:
+                    continue
+                cand = p.parent / target.replace('\\', '/')
+                cand_abs = Path(os.path.abspath(os.fspath(cand)))
+                if cand_abs == sdk_root or not cand_abs.is_relative_to(sdk_root):
+                    continue
+                real = cand_abs.resolve()
+                p_real = p.resolve()
+                if real == p_real or real == sdk_root or not real.is_relative_to(sdk_root):
+                    continue
+                if real.is_dir():
+                    if p_real.is_relative_to(real) or real.is_relative_to(p_real):
+                        if error_cls is not None:
+                            raise exc_type(f'recursive directory text stub: {p.relative_to(sdk_root)} -> {target!r}')
+                        continue
+                    items = sorted(real.rglob('*'))
+                    p.unlink()
+                    p.mkdir(parents=True, exist_ok=True)
+                    for item in items:
+                        rel_item = item.relative_to(real)
+                        dst_item = p / rel_item
+                        if item.is_dir():
+                            _charge(1, 0)
+                            dst_item.mkdir(parents=True, exist_ok=True)
+                        elif item.is_file():
+                            fsize = max(0, item.stat().st_size)
+                            _charge(1, fsize)
+                            dst_item.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.copyfile(str(item), str(dst_item))
+                    round_fixed += 1
+                    fixed += 1
+                    if log:
+                        log(f'repaired dir {p.relative_to(sdk_root)} ← {target}')
+                elif real.is_file():
+                    real_bytes = real.read_bytes()
+                    if _is_symlink_stub_bytes(real_bytes) is not None:
+                        continue  # target is itself an unexpanded stub; next pass will resolve it
+                    if p.suffix == '.tbd' and real_bytes[:13] != b'--- !tapi-tbd':
+                        continue
+                    _charge(0, max(0, len(real_bytes) - st.st_size))
+                    p.write_bytes(real_bytes)
+                    round_fixed += 1
+                    fixed += 1
+                    if log:
+                        log(f'repaired {p.name} ← {target}')
+            except OSError:
+                continue
+        if not round_fixed:
+            break
+    return fixed
+
+
+_TBD_REPAIRED = False
+
 def ios_sdk() -> Path | None:
     """The `iPhoneOS<ver>.sdk` folder: a directory with `SDKSettings.json` and stub libraries.
 
     Accepting only a folder that looks like an SDK keeps a stale or half-extracted download from
     being reported as `ok` and then failing deep inside the build.
     """
+    global _TBD_REPAIRED
     for p in _sdk_candidates():
         if is_sdk_dir(p):
+            if not _TBD_REPAIRED:
+                _TBD_REPAIRED = True
+                try:      # a cached SDK from a pre-fix git route carries text stubs; fix once
+                    repair_tbd_stubs(p)
+                except OSError:
+                    pass
             return p
     return None
 
@@ -637,6 +774,40 @@ def is_sdk_dir(p: os.PathLike | str) -> bool:
         return any((fw / n).exists() for n in ('UIKit.framework', 'Foundation.framework'))
     except OSError:
         return False
+
+
+def resolve_sdk_dir(p: os.PathLike | str | None) -> Path | None:
+    """Resolve a user-chosen file (`SDKSettings.json`) or folder (`iPhoneOS*.sdk` or its parent)
+    to the actual `iPhoneOS*.sdk` directory, or None if no valid SDK is there."""
+    if not p:
+        return None
+    cand = Path(p)
+    try:
+        if not cand.exists():
+            return None
+        if cand.is_file():
+            cur = cand.parent
+            for _ in range(6):
+                if is_sdk_dir(cur):
+                    return cur
+                if cur.parent == cur:
+                    break
+                cur = cur.parent
+            return None
+        if is_sdk_dir(cand):
+            return cand
+        for sub in sorted(cand.glob('iPhoneOS*.sdk'), reverse=True):
+            if is_sdk_dir(sub):
+                return sub
+        for sub in sorted((x for x in cand.iterdir() if x.is_dir()), reverse=True):
+            if is_sdk_dir(sub):
+                return sub
+            for nested in sorted(sub.glob('iPhoneOS*.sdk'), reverse=True):
+                if is_sdk_dir(nested):
+                    return nested
+    except OSError:
+        return None
+    return None
 
 
 def sdk_version(sdk: Path) -> tuple[str, str]:
@@ -705,20 +876,63 @@ def sdk_tree_digest(sdk: Path, limit: int = 4_000_000) -> str:
 
 # ---------------------------------------------------------------- Metal
 
+def resolve_metal_dir(p: os.PathLike | str | None) -> Path | None:
+    """Resolve a user-chosen file (`metal.exe`, `metallib.exe`) or folder (`Metal Developer Tools`,
+    its `bin/` or `ios/` subfolder, or a wrapper folder) to the Metal Developer Tools root."""
+    if not p:
+        return None
+    cand = Path(p)
+    try:
+        if not cand.exists():
+            return None
+        if cand.is_file():
+            # User picked `metal.exe` or `metallib.exe` (or another binary beside `metal.exe`)
+            # inside the file dialog. Step up from the directory holding `metal.exe`.
+            cand = cand.parent
+        if not cand.is_dir():
+            return None
+        # User picked `<root>/ios` or `<root>/macos` (must check before `<cand>/bin/metal.exe`,
+        # because `<root>/ios` also has `bin/metal.exe` inside it)
+        if cand.name.lower() in ('ios', 'macos'):
+            parent = cand.parent
+            if (parent / 'ios' / 'bin' / 'metal.exe').is_file() or (parent / 'bin' / 'metal.exe').is_file():
+                return parent
+        # Standard root: `<root>/bin/metal.exe` (5.x/6.x) or `<root>/ios/bin/metal.exe` (4.x)
+        if (cand / 'bin' / 'metal.exe').is_file() or (cand / 'ios' / 'bin' / 'metal.exe').is_file():
+            return cand
+        # User picked `<root>/bin` or `<root>/ios/bin` (or a flat folder holding `metal.exe`)
+        if (cand / 'metal.exe').is_file():
+            if cand.name.lower() == 'bin':
+                up = cand.parent
+                if up.name.lower() in ('ios', 'macos'):
+                    return up.parent
+                return up
+            return cand
+        # User picked an outer wrapper folder one level above the unpacked root
+        for sub in sorted((x for x in cand.iterdir() if x.is_dir()), reverse=True):
+            if (sub / 'bin' / 'metal.exe').is_file() or (sub / 'ios' / 'bin' / 'metal.exe').is_file():
+                return sub
+    except OSError:
+        return None
+    return None
+
+
 def metal_dir() -> Path | None:
     """Metal Developer Tools for Windows root (it holds `bin/metal.exe`, or `ios/` + `macos/`)."""
-    cands: list[Path | str | None] = [setting('metal_dir'), os.environ.get(ENV_METAL)]
+    configured = [setting('metal_dir'), os.environ.get(ENV_METAL)]
+    cands: list[Path | str | None] = list(configured)
+    cands.append(tools_dir() / 'metal-developer-tools')
+    cands.append(bundled_tools_dir() / 'metal-developer-tools')
     for base in (os.environ.get('ProgramFiles'), os.environ.get('ProgramFiles(x86)')):
         if base:
             cands += sorted(glob.glob(os.path.join(base, 'Metal Developer Tools*')), reverse=True)
-    root = _first_existing(cands)
-    if root is None:
-        return None
-    # 4.x shipped one toolchain per OS in ios/ and macos/; 5.x and 6.x ship one bin/ for every
-    # target. Point at whichever folder actually holds metal.exe.
-    if (root / 'bin' / 'metal.exe').is_file() or (root / 'ios' / 'bin' / 'metal.exe').is_file():
-        return root
-    return root
+    for c in cands:
+        resolved = resolve_metal_dir(c)
+        if resolved is not None:
+            return resolved
+    # Fall back to the first existing configured folder so `check_all` can report
+    # `not found under <mroot>` when a user-configured path holds no `metal.exe`.
+    return _first_existing(configured)
 
 
 def metal_tool(name: str, sdk: str = 'iphoneos') -> Path | None:
@@ -733,7 +947,7 @@ def metal_tool(name: str, sdk: str = 'iphoneos') -> Path | None:
         return None
     sub = 'ios' if sdk.startswith('iphone') else 'macos'
     pats = (f'{sub}/bin/{name}.exe', f'{sub}/**/bin/{name}.exe', f'**/{sub}/**/{name}.exe',
-            f'bin/{name}.exe', f'**/bin/{name}.exe')
+            f'bin/{name}.exe', f'**/bin/{name}.exe', f'{name}.exe')
     for pat in pats:
         hits = sorted(glob.glob(str(root / pat), recursive=True))
         if hits:
@@ -773,6 +987,26 @@ def find_exe(name: str) -> Path | None:
     own = tools_dir() / f'zstd-{ZSTD_VERSION}' / f'{name}.exe'
     if name == 'zstd' and own.is_file():
         return own
+    if name in ('spirv-cross', 'glslangValidator'):
+        env_key = 'NSPB_SPIRV_CROSS' if name == 'spirv-cross' else 'NSPB_GLSLANG_VALIDATOR'
+        if env_bin := os.environ.get(env_key):
+            p = Path(env_bin)
+            if p.is_file():
+                return p
+        here = Path(__file__).resolve()
+        roots = [os.environ.get('NSPB_REPO')]
+        for anc in here.parents:
+            roots.append(str(anc / 'engine'))
+        try:
+            from .. import engine as _eng
+            roots.extend((_eng.bundled_engine(), _eng.engine_root(str(here.parents[3]))))
+        except Exception:
+            pass
+        for r in roots:
+            if r:
+                p = Path(r) / 'dm' / 'gfx' / 'tools' / 'spirv_cross_bin' / f'{name}.exe'
+                if p.is_file():
+                    return p
     for cand in (f'{name}.exe', name):
         if w := shutil.which(cand):
             return Path(w)
@@ -887,22 +1121,24 @@ def ascii_temp_dir(prefix: str = 'nspb-'):
         except UnicodeEncodeError:
             return False
     candidates = [tempfile.gettempdir()]
-    if os.name == 'nt':
-        candidates += [os.environ.get('PUBLIC', r'C:\Users\Public') + r'\Temp', r'C:\Windows\Temp', 'C:\\Temp']
-    for base in candidates:
-        if not base or not ok(base):
-            continue
-        try:
-            Path(base).mkdir(parents=True, exist_ok=True)
-            return _tf.TemporaryDirectory(prefix=prefix, dir=base)
-        except OSError:
-            continue
+    if os.name == 'nt' or 'PUBLIC' in os.environ:
+        candidates += [os.environ.get('PUBLIC', r'C:\Users\Public') + (r'\Temp' if os.name == 'nt' else '/Temp'),
+                       r'C:\Windows\Temp', 'C:\\Temp']
+    for allow_space in (False, True):
+        for base in candidates:
+            if not base or not ok(base) or (not allow_space and ' ' in base):
+                continue
+            try:
+                os.makedirs(base, exist_ok=True)
+                return _tf.TemporaryDirectory(prefix=prefix, dir=base)
+            except OSError:
+                continue
     # Nothing ASCII is writable: fall back to the default (created first — the caller may be on a
     # system where gettempdir() names a folder that does not exist yet) and let the tool say what
     # it says.
     default = tempfile.gettempdir()
     try:
-        Path(default).mkdir(parents=True, exist_ok=True)
+        os.makedirs(default, exist_ok=True)
     except OSError:
         pass
     return _tf.TemporaryDirectory(prefix=prefix, dir=default)
@@ -921,7 +1157,9 @@ def probe_metal(sdk: Path) -> tuple[bool, str]:
         a = Path(td) / 'probe.air'
         lib = Path(td) / 'probe.metallib'
         m.write_text(src, encoding='utf-8')
-        tgt = f'air64-apple-ios{sdk_major(sdk_version(sdk)[0]) or IOS_DEPLOYMENT.split(".")[0]}.0'
+        dep_maj = int(IOS_DEPLOYMENT.split('.')[0])
+        maj = min(sdk_major(sdk_version(sdk)[0]) or dep_maj, dep_maj)
+        tgt = f'air64-apple-ios{maj}.0'
         for cmd, what in (([str(metal), '-target', tgt, '-c', str(m), '-o', str(a)], 'metal'),
                           ([str(metallib), str(a), '-o', str(lib)], 'metallib')):
             try:
@@ -939,7 +1177,38 @@ def probe_metal(sdk: Path) -> tuple[bool, str]:
         return True, f'{lib.stat().st_size} byte metallib for {tgt}'
 
 
-def probe_link(sdk: Path) -> tuple[bool, str]:
+def link_attempt_summary(r: subprocess.CompletedProcess) -> str:
+    """One failed strategy: the exit code plus the output's last lines (all of them, not just
+    one — '(no output)' alone was the report's whole diagnostic)."""
+    lines = (r.stderr or r.stdout or '').strip().splitlines() or ['(no output)']
+    tail = ' | '.join(l.strip() for l in lines[-3:])
+    return f'exit {r.returncode} (0x{r.returncode & 0xFFFFFFFF:08x}): {tail[:500]}'
+
+
+def link_failure_summary(attempts: list[tuple[str, str, list[str]]], lld_line: str,
+                         base: list[str], sdk: Path,
+                         verbose: list[str] | None = None,
+                         t=None) -> str:
+    """Every failed strategy, the linker's self-check, the exact command to try by hand, and —
+    when the SDK lives under a non-ASCII path — the one hint that has fixed this exact shape
+    before: ld64.lld's Windows port can fail to open narrow-char paths silently, while clang's
+    front end (the compile probe) handles them fine. `t` is the model's translator: the hint is
+    a localization key and must reach the panel translated, not as a raw key.
+    """
+    parts = [f'link failed {len(attempts)} ways; ld64.lld self-check: {lld_line[:140]}']
+    for how, summary, _cmd in attempts:
+        parts.append(f'{how}: {summary}')
+    parts.append('try by hand: ' + ' '.join([*base, '-fuse-ld=lld', '-o', '%TEMP%\\probe.exe', '<probe.c>']))
+    try:
+        str(sdk).encode('ascii')
+    except UnicodeEncodeError:
+        if t: parts.append(t('dep.fix.nonascii'))
+    if verbose:
+        parts.append('verbose: ' + ' | '.join(verbose))
+    return ' — '.join(parts)
+
+
+def probe_link(sdk: Path, t=None) -> tuple[bool, str]:
     """Link a tiny executable for iOS and check it is an arm64 MH_EXECUTE with an iOS platform.
 
     Only the linker and the SDK's stubs are exercised, not the game's own code: an undefined
@@ -955,13 +1224,26 @@ def probe_link(sdk: Path) -> tuple[bool, str]:
     # Step 0: run the linker by itself. A silent clang failure (the report: exit 1, no output on
     # either stream) cannot say whether the linker is broken or clang's drive of it is, and the
     # two have different fixes. lld --version is the smallest probe that separates them.
-    v = subprocess.run([str(lld), '--version'], capture_output=True, text=True, timeout=60,
-                       **no_window())
+    try:
+        v = subprocess.run([str(lld), '--version'], capture_output=True, text=True, timeout=60,
+                           **no_window())
+    except OSError as e:
+        return False, f'cannot run {lld.name}: {e}'
     lld_self = (v.stdout or v.stderr or '').strip().splitlines()
     lld_line = lld_self[0] if lld_self else f'exit {v.returncode}, no output'
     if v.returncode != 0:
         return False, (f'{lld.name} does not run by itself (exit {v.returncode}): {lld_line[:200]}'
                        ' — reinstall LLVM-MinGW')
+    # The link needs libSystem's stub from the SDK that a hollow or partial download lacks; its
+    # absence reads as "undefined symbol: puts" (libc) at link time while the COMPILE probe
+    # stays green (it needs headers only). Name it before blaming the linker. iOS executables
+    # use LC_MAIN, so a real SDK ships no crt*.o at all — checking for one rejected complete SDKs.
+    missing = [n for n, there in (
+        ('usr/lib/libSystem.tbd', (sdk / 'usr' / 'lib' / 'libSystem.tbd').is_file()),
+    ) if not there]
+    if missing:
+        return False, (f'SDK is missing {", ".join(missing)}: the download is incomplete — '
+                       're-download the SDK in the app, or use the xip route (doctor --sdk-xip)')
 
     src = '#include <stdio.h>\nint main(void) { puts("probe"); return 0; }\n'
     with ascii_temp_dir('nspb-link-') as td:
@@ -971,41 +1253,40 @@ def probe_link(sdk: Path) -> tuple[bool, str]:
         target = f'-target arm64-apple-ios{IOS_DEPLOYMENT}'.split()
         base = [str(clang), *target, '-isysroot', str(sdk)]
 
-        def run(extra: list[str], env: dict[str, str] | None) -> subprocess.CompletedProcess:
+        # Strategies, in order: the build's own shape first (build_app.link drives the linker
+        # with -fuse-ld=lld and the linker's folder on PATH — if the probe cannot link that way,
+        # neither can the build), then naming the linker directly, then -B as clang's last
+        # resort. Each failure is kept; all three failing produces the full report.
+        attempts: list[tuple[str, str, list[str]]] = []   # (strategy, summary, command)
+        for how, extra, env in (
+                ('fuse-ld (build-style)', ['-fuse-ld=lld'], None),
+                ('ld-path', ['-fuse-ld=lld', f'--ld-path={lld}'], None),
+                ('-B dir', [f'-B{lld.parent}', '-fuse-ld=lld'], None),
+                # Apple's driver adds libSystem itself; a cross driver that does not leaves
+                # every libc symbol undefined (the report: puts). Name it explicitly.
+                ('explicit -lSystem', ['-fuse-ld=lld', '-lSystem'], None)):
+            run_env = dict(os.environ)   # a child on Windows needs the full env (SystemRoot etc.)
+            if extra[:1] == ['-fuse-ld=lld'] and how.startswith('fuse-ld'):
+                run_env['PATH'] = str(lld.parent) + os.pathsep + run_env.get('PATH', '')
             cmd = [*base, *extra, '-o', str(out), str(c)]
-            return subprocess.run(cmd, capture_output=True, text=True, timeout=180,
-                                  env=env, **no_window())
-
-        def summary(r: subprocess.CompletedProcess) -> str:
-            # the exit code is the evidence: 0xC0000135 (STATUS_DLL_NOT_FOUND) reads as "a DLL is
-            # missing", not "the linker is bad"; an empty stream pair stays honest as (no output)
-            tail = ((r.stderr or r.stdout or '').strip().splitlines() or ['(no output)'])[-1]
-            return f'exit {r.returncode} (0x{r.returncode & 0xFFFFFFFF:08x}): {tail[:400]}'
-
-        # Strategy 1 — the build's own shape (build_app.link): -fuse-ld=lld and the linker's
-        # folder on PATH. If the machine's PATH handling differs from the probe's assumptions,
-        # this is what the build would do, so it is the first thing to try.
-        env = dict(os.environ)   # a child on Windows needs the full env (SystemRoot etc.)
-        env['PATH'] = str(lld.parent) + os.pathsep + env.get('PATH', '')
-        r = run(['-fuse-ld=lld'], env)
-        if r.returncode == 0:
-            how = 'fuse-ld (build-style)'
-        else:
-            first = summary(r)
-            # Strategy 2 — name the linker directly (--ld-path), bypassing every lookup.
-            r = run(['-fuse-ld=lld', f'--ld-path={lld}'], dict(os.environ))
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=180,
+                               env=run_env, **no_window())
             if r.returncode == 0:
-                how = 'ld-path'
-            else:
-                second = summary(r)
-                # Strategy 3 — -fuse-ld=full or the absolute path as -B: clang's last resort
-                r = run([f'-B{lld.parent}', '-fuse-ld=lld'], dict(os.environ))
-                if r.returncode == 0:
-                    how = '-B dir'
-                else:
-                    third = summary(r)
-                    return False, (f'link failed 3 ways; ld64.lld self-check: {lld_line[:120]}; '
-                                   f'fuse-ld {first}; ld-path {second}; -B {third}')
+                how_ok = how
+                break
+            attempts.append((how, link_attempt_summary(r), cmd))
+        else:
+            # One more run, verbose: the driver's own link command, the runtime libs it adds
+            # (-lSystem, crt) and the library search paths — the three things that decide whether
+            # libc (puts) resolves. Capped, since -v prints hundreds of lines.
+            rv = subprocess.run([*base, '-fuse-ld=lld', '-v', '-o', str(out), str(c)],
+                                capture_output=True, text=True, timeout=180,
+                                env=dict(os.environ), **no_window())
+            interesting = [l.strip() for l in (rv.stderr or rv.stdout or '').splitlines()
+                           if any(k in l for k in ('-lSystem', 'crt', 'Library search',
+                                                   'ld64.lld', 'error'))][:12]
+            return False, link_failure_summary(attempts, lld_line, base, sdk,
+                                               verbose=interesting, t=t)
         try:
             data = out.read_bytes()
         except OSError as e:
@@ -1020,7 +1301,7 @@ def probe_link(sdk: Path) -> tuple[bool, str]:
         plat = macho_platform(data)
         if plat is not None and plat != PLATFORM_IOS:
             return False, f'platform {plat} is not iOS ({PLATFORM_IOS})'
-        return True, f'arm64 MH_EXECUTE{"" if plat is None else f", platform {plat}"}, {len(data)} bytes ({how})'
+        return True, f'arm64 MH_EXECUTE{"" if plat is None else f", platform {plat}"}, {len(data)} bytes ({how_ok})'
 
 
 def macho_platform(data: bytes) -> int | None:
@@ -1048,7 +1329,7 @@ def macho_platform(data: bytes) -> int | None:
 
 # ---------------------------------------------------------------- the whole picture
 
-def check_all(deep: bool = False) -> list[Probe]:
+def check_all(deep: bool = False, t=None) -> list[Probe]:
     """Every component, in the order the dependency panel shows them.
 
     `deep` adds the compile / link / Metal probes. They take a few seconds, so the panel runs
@@ -1165,7 +1446,7 @@ def check_all(deep: bool = False) -> list[Probe]:
             # compiler); this one adds the SDK to the same probe shape the build uses
             ok, detail = probe_compile(sdk, clang)
             out.append(Probe('probe_compile', 'cross-compile probe', 'ok' if ok else 'wrong', detail))
-            ok2, detail2 = probe_link(sdk)
+            ok2, detail2 = probe_link(sdk, t=t)
             out.append(Probe('probe_link', 'cross-link probe', 'ok' if ok2 else 'wrong', detail2))
         if sdk and metal_ok:
             ok3, detail3 = probe_metal(sdk)

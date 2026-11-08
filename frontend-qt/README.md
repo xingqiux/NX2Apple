@@ -1,23 +1,26 @@
-# NS Port Builder — Qt front end (Windows and macOS)
+# NX2Apple — Qt front end (Windows and macOS)
 
 The SwiftUI app in `../frontend/` is the macOS-native one. This is the **cross-platform**
 counterpart: same job, same strings, built with PySide6 so Windows users get a native window.
 
 ## Why a second front end
 
-The build pipeline (`scripts/build_ipa_from_nsp.py`) is Python and runs on both systems, but
+The build pipeline (`scripts/build_ipa_from_nsp.py` of the engine) is Python and runs on both systems, but
 the SwiftUI app cannot: it needs macOS. Rather than maintain two unrelated GUIs, this one is
 written once and runs everywhere Python and Qt do.
 
 | | SwiftUI (`frontend/`) | Qt (this) |
 |---|---|---|
 | Platforms | macOS 13+ | Windows 10+, macOS 11+ |
-| Language | Swift | Python 3.9+ |
-| Strings | `Localization.swift` | generated from that same file |
+| Language | Swift | Python 3.9+ for the launcher and its tests |
+| Strings | `l10n/*.json`, read by `LocalizationFiles.swift` | the same files, read by `nspb_qt/l10n.py` |
 | Build logic | runs the Python scripts | runs the same scripts |
 
-The strings are **generated** from the SwiftUI table (`gen_localization.py`), so the two front
-ends cannot drift apart: edit `Localization.swift`, run the generator.
+The strings are **read** from `../frontend/l10n/<code>.json`, one file per language, so the two front
+ends cannot drift apart: a new string is a line in `en.json` and in `zh.json`. The language list comes
+from the files too (`Lang.all()`, each language's own name and the locale names that select it,
+Windows ones such as `german` included, are in its `_language` entry), so a new language is one new file
+and no change here. A frozen build carries the folder as `l10n` (`build-qt.yml` adds it with `--add-data`).
 
 ## Run it
 
@@ -29,6 +32,13 @@ python3 -m venv .venv
 
 From this folder. It looks for the repository checkout next to itself, in `~/NX2Apple`, or
 wherever `NSPB_REPO` points, and the repository group lets you pick it by hand.
+
+## Look
+
+`nspb_qt/style.py` follows the Mac launcher: near-black background, cream accent, the state colours
+of its `LauncherPalette`, and the Manrope typeface (SIL OFL 1.1). The font is not copied here: a
+source run loads `../frontend/fonts/Manrope.ttf`, and the Windows build adds it and its licence to
+the bundle's `fonts` folder (`build-qt.yml`). If the file is missing the system font is used.
 
 ## What works today
 
@@ -42,19 +52,29 @@ wherever `NSPB_REPO` points, and the repository group lets you pick it by hand.
   recognised from the dump names.
 - Build: runs the same script the SwiftUI app runs, streams its stage lines and log, then packs
   the RomFS archive and reports where the IPA and archive landed.
+- Show in folder follows the selected IPA kind, checking the app bundle inside each candidate
+  IPA. Remembered outputs still work after a folder change or when a profile supplies the filename.
+  Missing files, unrecognized archives and outputs of the other kind are not offered.
 - `--work-dir` is passed only when the checkout's script declares it (an upstream checkout has
   no such option — issue #5).
-- Bilingual: Chinese on Chinese devices, English elsewhere, and the header button switches.
+- Languages: every language that has a file in `frontend/l10n` (today Chinese, Swedish, German and French)
+  on devices in that language, English elsewhere, and the header button cycles through them.
 
 ## What is not there yet
 
-- **The Windows build path has run on a real Windows machine** — a handheld PC, which is where the
-  bug reports came from — through repository download, git auto-install and the LLVM / SDK / .NET
-  downloads. The compile, link, `Metal` compile and the final IPA on Windows have still not been
-  exercised end to end against a genuine LLVM-MinGW + iPhoneOS SDK + Metal Developer Tools
-  install. See [Windows build → Open risks](#open-risks).
-- No self-update. Repository download and update buttons do exist (`Download repository`,
-  `Check for updates`, `Pull updates`), and they log what git is doing.
+- **The Windows build path remains experimental.** One Rhythm Heaven Groove 1.0.0 IPA built on
+  Windows installed and launched on an iPhone Air running iOS 27.0.1; Play started the game, and the
+  button mappings were correct. That IPA needed three local changes beyond this branch:
+  seedds/nxnative#591 (the Windows image reader), an updated `dmsh_chain.lock` with a regenerated
+  `DMSH_CHAIN` for this machine's SPIRV-Cross and Metal tools, and a two-line declaration of
+  `CMMotionManager.deviceMotionBody` because the Windows toolchain still ships `iPhoneOS26.0.sdk`.
+  SDK symlinks were materialized by hand. The current unmodified frontend is not yet verified end
+  to end; other games and longer-term performance remain unverified. See
+  [Windows build → Open risks](#open-risks).
+- Self-update (`nspb_qt/app_update.py`): checks `releases/latest` for `NX2Apple-windows-x64.zip`,
+  verifies the SHA-256 digest when present, unpacks and swaps the bundle in place via a detached
+  updater script after the running process exits. Repository download and update buttons also exist
+  (`Download repository`, `Check for updates`), logging what git is doing.
 - No per-stage progress bar, no cancel-with-cleanup (cancel terminates the child).
 
 ## Layout
@@ -66,9 +86,8 @@ nspb_qt/
   ui.py             the window
   platform_util.py  per-OS paths, tool discovery, child environment
   i18n.py           language choice
-  localization.py   generated from ../frontend/Sources/NSPortBuilder/Localization.swift
+  l10n.py           the texts, read from ../frontend/l10n/*.json (the SwiftUI app reads the same files)
   win/              the Windows build path; imported only when sys.platform is win32
-gen_localization.py regenerates localization.py
 tests/test_win.py   the Windows-path tests that can run on macOS
 ```
 
@@ -117,7 +136,7 @@ Run this first if you prefer the command line. It lists what is missing and wher
 python -m nspb_qt.win.doctor
 ```
 
-1. **Python 3.10+**, then `pip install PySide6 lz4 capstone fonttools pillow`
+1. **Python 3.12+** for the game build scripts, then `pip install PySide6 lz4 capstone fonttools zbic pillow`
    (and `backports.zstd` before Python 3.14).
 2. **.NET SDK 10** — the app downloads it (the zip, not the installer: no administrator rights,
    about 287 MB), or get it from <https://dotnet.microsoft.com/download/dotnet/10.0> (SDK, x64).
@@ -258,9 +277,9 @@ the tool offers it. The IPA name and the RomFS archive come out where the macOS 
 
 ## Open risks
 
-The app's own toolchain discovery, downloads and repository handling have now run on a real
-Windows machine (a handheld PC). These are the parts that still have not, and that only a full
-build on Windows plus a device run can settle:
+The frontend's setup has run on Windows, and one locally patched Windows build installed, launched
+and started the game on an iPhone. That test does not settle these risks
+for other games or for an unmodified checkout:
 
 1. **Shader libraries on the device.** They come from the Windows Metal compiler, not Xcode's.
    They must load and render on iOS 26+ (`newLibraryWithURL`). `own_compilers.py` accepts a
